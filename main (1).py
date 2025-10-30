@@ -1,0 +1,815 @@
+import os
+import re
+import time
+import random
+import asyncio
+import logging
+import aiohttp
+import re
+import random
+import time
+from selenium.common.exceptions import SessionNotCreatedException
+import pandas as pd
+from tqdm import tqdm
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import csv
+from datetime import datetime
+import json
+
+# Configuration
+INPUT_CSV = 'E:\\nims\\Website Checker\\sites.csv'
+OUTPUT_CSV = 'output.csv'
+MAX_WORKERS = 15  # Increased for better performance
+SELENIUM_POOL_SIZE = 5  # Number of Selenium instances to keep in pool
+REQUEST_TIMEOUT = 20
+SELENIUM_TIMEOUT = 25
+CHECKPOINT_DIR = 'checkpoints'
+CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, 'scraping_progress.json')
+TEMP_OUTPUT_CSV = 'output_temp.csv'
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/91.0.864.59",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15"
+]
+
+@dataclass
+class ScrapingResult:
+    """Data class to hold scraping results"""
+    website_status: str = 'Broken'
+    instagram_link: str = ''
+    facebook_link: str = ''
+    twitter_link: str = ''
+    pinterest_link: str = ''
+    linkedin_link: str = ''
+    social_media_presence: str = 'No'
+    emails: str = ''
+    phone_numbers: str = ''
+    integrated_videos: str = 'No'
+    integrated_video_urls: str = ''
+    d2c_presence: str = 'No'
+    ecommerce_presence: str = 'No'
+    street_address: str = ''
+
+class SeleniumPool:
+    """Pool of Selenium WebDriver instances for better performance"""
+    
+    def __init__(self, pool_size: int = SELENIUM_POOL_SIZE):
+        self.pool_size = pool_size
+        self.drivers = []
+        self.available = asyncio.Queue()
+        self._create_lock = asyncio.Lock()
+        
+    async def __aenter__(self):
+        await self.initialize()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close_all()
+        
+    async def initialize(self):
+        """Initialize the driver pool (creates drivers concurrently in a thread pool)"""
+        loop = asyncio.get_event_loop()
+        create_tasks = [loop.run_in_executor(None, self._create_driver_with_retries, i) for i in range(self.pool_size)]
+        results = await asyncio.gather(*create_tasks)
+        for drv in results:
+            if drv:
+                self.drivers.append(drv)
+                await self.available.put(drv)
+        if not self.drivers:
+            raise RuntimeError("No Chrome drivers could be created")
+            
+    def _build_options(self):
+        chrome_options = Options()
+        # Use new headless mode where available and do not disable JS by default
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--log-level=3')
+        chrome_options.add_argument(f'--user-agent={random.choice(USER_AGENTS)}')
+        # Keep JS enabled; enable other flags as needed elsewhere
+        return chrome_options
+        
+    def _create_driver_with_retries(self, idx: int, retries: int = 3):
+        """Create driver with retries and fallbacks to avoid ChromeDriver mismatch freezing the script."""
+        for attempt in range(1, retries + 1):
+            try:
+                return self._create_driver()
+            except SessionNotCreatedException as exc:
+                # Typical mismatch: try selenium-manager first (webdriver.Chrome without explicit Service),
+                # then fallback to webdriver-manager install (forces download of matching driver).
+                logging.warning("SessionNotCreatedException creating driver (attempt %d/%d): %s", attempt, retries, exc)
+                try:
+                    # Let Selenium Manager attempt to provide the correct binary
+                    opts = self._build_options()
+                    return webdriver.Chrome(options=opts)
+                except Exception as e2:
+                    logging.debug("Selenium Manager fallback failed: %s", e2)
+                try:
+                    # Fallback to webdriver-manager install (this should fetch correct version)
+                    path = ChromeDriverManager().install()
+                    opts = self._build_options()
+                    return webdriver.Chrome(service=Service(path), options=opts)
+                except Exception as e3:
+                    logging.debug("webdriver-manager fallback failed: %s", e3)
+            except Exception as e:
+                logging.exception("Unexpected error while creating driver (attempt %d/%d): %s", attempt, retries, e)
+            time.sleep(1)
+        logging.error("Failed to create Chrome driver after %d attempts", retries)
+        return None
+        
+    def _create_driver(self):
+        """Create a new Chrome WebDriver instance preferring Selenium Manager (no explicit driver path)."""
+        options = self._build_options()
+        try:
+            # Prefer Selenium Manager (Selenium >=4.6). This will download the correct ChromeDriver for the installed browser.
+            return webdriver.Chrome(options=options)
+        except SessionNotCreatedException:
+            # If selenium-manager didn't resolve it, fallback to webdriver-manager download and use explicit service path.
+            path = ChromeDriverManager().install()
+            return webdriver.Chrome(service=Service(path), options=options)
+        
+    async def get_driver(self):
+        """Get an available driver from the pool"""
+        return await self.available.get()
+        
+    async def return_driver(self, driver):
+        """Return a driver to the pool"""
+        await self.available.put(driver)
+        
+    async def close_all(self):
+        """Close all drivers"""
+        # Drain queue to avoid awaiting drivers that are shutting down
+        try:
+            while not self.available.empty():
+                _ = self.available.get_nowait()
+        except Exception:
+            pass
+        for driver in self.drivers:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        self.drivers = []
+        self.available = asyncio.Queue()  # Reset the queue
+
+class CheckpointManager:
+    """Manages checkpointing of scraping progress"""
+    
+    def __init__(self):
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        self.checkpoint_file = CHECKPOINT_FILE
+        self.processed_urls = self.load_checkpoint()
+    
+    def load_checkpoint(self) -> dict:
+        """Load progress from checkpoint file"""
+        if os.path.exists(self.checkpoint_file):
+            try:
+                with open(self.checkpoint_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save_checkpoint(self, url: str, result: dict):
+        """Save progress for a single URL"""
+        self.processed_urls[url] = {
+            'timestamp': datetime.now().isoformat(),
+            'result': result.__dict__
+        }
+        try:
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(self.processed_urls, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
+    
+    def get_processed_urls(self) -> set:
+        """Get set of already processed URLs"""
+        return set(self.processed_urls.keys())
+
+class WebScraper:
+    """Main web scraping class with improved functionality"""
+    
+    def __init__(self):
+        self.session = None
+        self.selenium_pool = None
+        
+        # Note: Phone extraction now uses multiple patterns in extract_phone_numbers method
+        
+        self.email_pattern = re.compile(
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        )
+        
+        # Social media patterns for better detection
+        self.social_patterns = {
+            'Instagram Link': [r'instagram\.com/[\w\.]+', r'instagr\.am/[\w\.]+'],
+            'Facebook Link': [r'facebook\.com/[\w\.]+', r'fb\.com/[\w\.]+'],
+            'Twitter Link': [r'twitter\.com/[\w\.]+', r'x\.com/[\w\.]+'],
+            'Pinterest Link': [r'pinterest\.com/[\w\.]+', r'pin\.it/[\w\.]+'],
+            'LinkedIn Link': [r'linkedin\.com/[\w\./]+', r'lnkd\.in/[\w\.]+']
+        }
+        
+        # Enhanced keyword lists
+        self.d2c_keywords = [
+            'shop', 'buy now', 'cart', 'checkout', 'order now', 'order online', 
+            'free shipping', 'subscribe', 'direct buy', 'special offers', 
+            'limited edition', 'shop now', 'store', 'add to cart', 'purchase',
+            'buy direct', 'exclusive', 'subscribe and save'
+        ]
+        
+        self.ecommerce_keywords = [
+            'shopify', 'woocommerce', 'bigcommerce', 'magento', 'shop', 'order', 
+            'cart', 'checkout', 'buy now', 'free shipping', 'order now', 'pay now', 
+            'sale', 'ecommerce', 'online store', 'store', 'marketplace', 'paypal', 
+            'stripe', 'amazon pay', 'apple pay', 'google pay', 'klarna', 'afterpay'
+        ]
+
+    async def __aenter__(self):
+        await self.initialize()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
+        
+    async def initialize(self):
+        """Initialize async components"""
+        connector = aiohttp.TCPConnector(limit=50, limit_per_host=10)
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        self.selenium_pool = SeleniumPool(SELENIUM_POOL_SIZE)
+        await self.selenium_pool.__aenter__()
+        
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self.session:
+            await self.session.close()
+        if self.selenium_pool:
+            await self.selenium_pool.__aexit__(None, None, None)
+
+    def extract_name_from_url(self, url: str) -> str:
+        """Extract a name from URL"""
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace('www.', '')
+            return domain.split('.')[0].title()
+        except:
+            return "Unknown"
+
+    async def check_website_status(self, url: str) -> str:
+        """Check if website is accessible"""
+        try:
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+            }
+            
+            async with self.session.get(url, headers=headers) as response:
+                return 'Proper' if response.status == 200 else 'Broken'
+                
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout checking status for {url}")
+            return 'Broken'
+        except Exception as e:
+            logger.warning(f"Error checking status for {url}: {e}")
+            return 'Broken'
+
+    def extract_phone_numbers(self, text: str) -> str:
+        """Extract US phone numbers with strict validation"""
+        # Clean text first - remove obvious JS/HTML patterns
+        cleaned_text = text
+        
+        # Remove JavaScript code patterns
+        js_patterns = [
+            r'function\s*\([^)]*\)\s*\{[^}]*\}',  # function definitions
+            r'var\s+\w+\s*=\s*[^;]+;',  # variable declarations
+            r'if\s*\([^)]+\)\s*\{[^}]*\}',  # if statements
+            r'for\s*\([^)]+\)\s*\{[^}]*\}',  # for loops
+            r'\.js\b',  # .js file references
+            r'script\s*>',  # script tags
+            r'function\s+\w+',  # function names
+            r'\w+\(\s*\d+\s*\)',  # function calls with numbers
+        ]
+        
+        for pattern in js_patterns:
+            cleaned_text = re.sub(pattern, ' ', cleaned_text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Remove HTML attributes and CSS
+        html_patterns = [
+            r'style\s*=\s*["\'][^"\']*["\']',  # style attributes
+            r'class\s*=\s*["\'][^"\']*["\']',  # class attributes
+            r'id\s*=\s*["\'][^"\']*["\']',  # id attributes
+            r'data-\w+\s*=\s*["\'][^"\']*["\']',  # data attributes
+            r'<[^>]+>',  # HTML tags
+            r'&\w+;',  # HTML entities
+            r'px\b|em\b|rem\b|%\b',  # CSS units
+        ]
+        
+        for pattern in html_patterns:
+            cleaned_text = re.sub(pattern, ' ', cleaned_text, flags=re.IGNORECASE)
+        
+        # Multiple comprehensive US phone number patterns
+        us_phone_patterns = [
+            # Standard formats: (123) 456-7890, 123-456-7890, 123.456.7890, 123 456 7890
+            r'\b(?:\+?1[-.\s]?)?\(?([2-9]\d{2})\)?[-.\s]?([2-9]\d{2})[-.\s]?(\d{4})\b',
+            # With extensions: (123) 456-7890 x1234, 123-456-7890 ext 123
+            r'\b(?:\+?1[-.\s]?)?\(?([2-9]\d{2})\)?[-.\s]?([2-9]\d{2})[-.\s]?(\d{4})(?:\s*(?:x|ext|extension)\.?\s*\d{1,5})?\b',
+            # Parentheses format: (123)456-7890
+            r'\b\(([2-9]\d{2})\)([2-9]\d{2})[-.]?(\d{4})\b',
+            # 10 digits together: 1234567890 (but not in sequences like CSS or coordinates)
+            r'(?<!\d)(?:\+?1)?([2-9]\d{2})([2-9]\d{2})(\d{4})(?!\d)',
+        ]
+        
+        found_phones = set()
+        
+        for pattern in us_phone_patterns:
+            matches = re.finditer(pattern, cleaned_text, re.IGNORECASE)
+            for match in matches:
+                groups = match.groups()
+                if len(groups) >= 3:
+                    area_code, exchange, number = groups[0], groups[1], groups[2]
+                    
+                    # Validate US phone number rules
+                    if (area_code and exchange and number and
+                        len(area_code) == 3 and len(exchange) == 3 and len(number) == 4 and
+                        area_code[0] in '23456789' and  # Area code can't start with 0 or 1
+                        exchange[0] in '23456789' and   # Exchange can't start with 0 or 1
+                        area_code != '911' and          # Not emergency number
+                        exchange != '911'):             # Not emergency number
+                        
+                        # Format consistently
+                        formatted_phone = f"({area_code}) {exchange}-{number}"
+                        
+                        # Additional validation - check if it's likely a real phone
+                        full_number = area_code + exchange + number
+                        
+                        # Skip if it looks like:
+                        # - Sequential numbers (1234567890)
+                        # - Repeated patterns (1111111111, 1234123412)
+                        # - Common fake numbers
+                        if (not self._is_sequential(full_number) and
+                            not self._is_repeated_pattern(full_number) and
+                            not self._is_fake_number(full_number)):
+                            found_phones.add(formatted_phone)
+        
+        # Additional context-based filtering
+        valid_phones = []
+        for phone in found_phones:
+            # Check surrounding context to avoid false positives
+            phone_digits = re.sub(r'[^\d]', '', phone)
+            context_patterns = [
+                rf'\b(?:call|phone|tel|contact|reach)\s+.*?{re.escape(phone)}',
+                rf'{re.escape(phone)}.*?(?:office|mobile|cell|phone|contact)',
+                rf'(?:p:|phone:|tel:|telephone:)\s*{re.escape(phone)}',
+            ]
+            
+            # If we find context indicating it's actually a phone number, keep it
+            has_context = any(re.search(pattern, cleaned_text, re.IGNORECASE) 
+                            for pattern in context_patterns)
+            
+            # Or if it appears in common phone number locations
+            if has_context or self._appears_in_contact_context(phone, cleaned_text):
+                valid_phones.append(phone)
+            # If no specific context, but it's a well-formatted number, include it anyway
+            elif len(valid_phones) < 3:  # Limit to avoid too many false positives
+                valid_phones.append(phone)
+        
+        return ', '.join(sorted(set(valid_phones)))
+    
+    def _is_sequential(self, number: str) -> bool:
+        """Check if number is sequential (1234567890, etc.)"""
+        if len(number) != 10:
+            return False
+        
+        # Check for ascending/descending sequences
+        ascending = all(int(number[i]) == int(number[i-1]) + 1 for i in range(1, len(number)))
+        descending = all(int(number[i]) == int(number[i-1]) - 1 for i in range(1, len(number)))
+        
+        return ascending or descending
+    
+    def _is_repeated_pattern(self, number: str) -> bool:
+        """Check if number has repeated patterns"""
+        if len(number) != 10:
+            return False
+        
+        # All same digit
+        if len(set(number)) == 1:
+            return True
+        
+        # Repeated 2-digit patterns (1212121212)
+        if len(set([number[i:i+2] for i in range(0, 10, 2)])) == 1:
+            return True
+        
+        # Repeated 3-digit patterns (123123123)
+        if number[:3] == number[3:6] == number[6:9]:
+            return True
+        
+        return False
+    
+    def _is_fake_number(self, number: str) -> bool:
+        """Check against common fake/test numbers"""
+        fake_patterns = [
+            '5555555555', '1234567890', '0123456789', '9876543210',
+            '1111111111', '2222222222', '3333333333', '4444444444',
+            '6666666666', '7777777777', '8888888888', '9999999999',
+        ]
+        return number in fake_patterns
+    
+    def _appears_in_contact_context(self, phone: str, text: str) -> bool:
+        """Check if phone appears in contact-related context"""
+        # Look for contact-related keywords near the phone number
+        phone_pos = text.find(phone)
+        if phone_pos == -1:
+            return False
+        
+        # Check text around the phone number (±100 characters)
+        start = max(0, phone_pos - 100)
+        end = min(len(text), phone_pos + len(phone) + 100)
+        context = text[start:end].lower()
+        
+        contact_keywords = [
+            'contact', 'call', 'phone', 'telephone', 'tel', 'mobile', 'cell',
+            'office', 'business', 'customer service', 'support', 'help',
+            'reach', 'dial', 'number', 'speak', 'talk'
+        ]
+        
+        return any(keyword in context for keyword in contact_keywords)
+
+    def extract_emails(self, text: str) -> str:
+        """Extract email addresses with improved regex"""
+        emails = self.email_pattern.findall(text)
+        # Filter out common false positives
+        valid_emails = []
+        for email in emails:
+            if not any(ext in email.lower() for ext in ['.png', '.jpg', '.gif', '.css', '.js']):
+                valid_emails.append(email.lower())
+        return ', '.join(set(valid_emails))
+
+    def find_social_links(self, soup: BeautifulSoup, page_url: str) -> Dict[str, str]:
+        """Find social media links with improved detection"""
+        found = {platform: '' for platform in self.social_patterns.keys()}
+        found['Social Media Presence'] = 'No'
+        
+        # Get all links
+        links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            # Convert relative URLs to absolute
+            if href.startswith('/'):
+                href = urljoin(page_url, href)
+            links.append(href)
+        
+        all_text = ' '.join(links) + ' ' + soup.get_text()
+        
+        # Check for each social platform
+        for platform, patterns in self.social_patterns.items():
+            for pattern in patterns:
+                matches = re.findall(pattern, all_text, re.IGNORECASE)
+                if matches:
+                    # Get the full URL if possible
+                    for link in links:
+                        if any(re.search(p, link, re.IGNORECASE) for p in patterns):
+                            found[platform] = link
+                            found['Social Media Presence'] = 'Yes'
+                            break
+                    if not found[platform] and matches:
+                        found[platform] = matches[0]
+                        found['Social Media Presence'] = 'Yes'
+                    break
+        
+        return found
+
+
+    def extract_street_address(self, text: str) -> str:
+        """Extract likely US street addresses, including multi-line addresses."""
+        # Normalize line breaks and spaces
+        text = text.replace('\r', '').replace('\n', ' ')
+        # Regex for US addresses (street, optional suite, city, state, ZIP)
+        address_pattern = re.compile(
+            r'(\d{1,6}\s+[\w\s\.\-\,]{3,40}?\s(?:St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Dr|Drive|Ln|Lane|Way|Ct|Court|Pl|Place|Terrace|Pkwy|Parkway|Circle|Cir|Loop|Sq|Square|Trail|Trl|Hwy|Highway)\.?,?\s*(Suite\s*\d+\w*|Ste\.?\s*\d+\w*|Apt\.?\s*\d+\w*|Unit\s*\d+\w*)?,?\s*[\w\s\.]+,?\s*[A-Z]{2}\s*\d{5}(-\d{4})?)',
+            re.IGNORECASE
+        )
+        matches = address_pattern.findall(text)
+        addresses = [m[0].strip() for m in matches if len(m[0].strip()) > 10]
+        return ', '.join(addresses)
+    
+
+    async def extract_basic_info(self, url: str) -> Dict[str, str]:
+        """Extract basic information using HTTP requests"""
+        try:
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            }
+            
+            async with self.session.get(url, headers=headers) as response:
+                if response.status == 429:
+                    await asyncio.sleep(random.uniform(5, 10))
+                    return await self.extract_basic_info(url)
+                
+                response.raise_for_status()
+                content = await response.text()
+                
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Extract social links
+            socials = self.find_social_links(soup, url)
+            
+            # Get all text content
+            text_content = soup.get_text(separator=' ')
+            
+            # Get text from links too
+            link_text = ' '.join([a.get_text() + ' ' + a.get('href', '') 
+                                for a in soup.find_all('a', href=True)])
+            
+            combined_text = text_content + ' ' + link_text
+            
+            return {
+                **socials,
+                'emails': self.extract_emails(combined_text),
+                'phone_numbers': self.extract_phone_numbers(combined_text),
+                'street_address': self.extract_street_address(combined_text)
+            }
+        except Exception as e:
+            logger.warning(f"Error extracting basic info from {url}: {e}")
+            return {
+                'Instagram Link': '', 'Facebook Link': '', 'Twitter Link': '',
+                'Pinterest Link': '', 'LinkedIn Link': '', 'Social Media Presence': 'No',
+                'emails': '', 'phone_numbers': ''
+            }
+
+    async def analyze_with_selenium(self, url: str) -> Dict[str, str]:
+        """Analyze website using Selenium for dynamic content"""
+        driver = await self.selenium_pool.get_driver()
+        
+        try:
+            # Navigate to the page
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: driver.get(url)
+            )
+            
+            # Wait for page to load
+            await asyncio.sleep(random.uniform(2, 4))
+            
+            # Get page source
+            html = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: driver.page_source
+            )
+            
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Extract video information
+            video_urls = set()
+            
+            # Check for video tags
+            for video in soup.find_all('video'):
+                if video.get('src'):
+                    video_urls.add(video['src'])
+                for source in video.find_all('source'):
+                    if source.get('src'):
+                        video_urls.add(source['src'])
+            
+            # Check for embedded videos (YouTube, Vimeo, etc.)
+            for iframe in soup.find_all('iframe'):
+                src = iframe.get('src', '')
+                if any(platform in src for platform in ['youtube', 'vimeo', 'wistia', 'brightcove']):
+                    video_urls.add(src)
+            
+            # Get page content for keyword analysis
+            page_content = soup.get_text(separator=' ').lower()
+            
+            # Also check link hrefs and button text
+            for element in soup.find_all(['a', 'button']):
+                page_content += ' ' + element.get_text().lower()
+                if element.get('href'):
+                    page_content += ' ' + element.get('href').lower()
+            
+            # Analyze for D2C and E-commerce presence
+            has_d2c = any(keyword in page_content for keyword in self.d2c_keywords)
+            has_ecommerce = any(keyword in page_content for keyword in self.ecommerce_keywords)
+            
+            return {
+                'integrated_videos': 'Yes' if video_urls else 'No',
+                'integrated_video_urls': ', '.join(video_urls),
+                'd2c_presence': 'Yes' if has_d2c else 'No',
+                'ecommerce_presence': 'Yes' if has_ecommerce else 'No'
+            }
+            
+        except Exception as e:
+            logger.warning(f"Selenium analysis error for {url}: {e}")
+            return {
+                'integrated_videos': 'No',
+                'integrated_video_urls': '',
+                'd2c_presence': 'No',
+                'ecommerce_presence': 'No'
+            }
+        finally:
+            await self.selenium_pool.return_driver(driver)
+
+    async def process_single_url(self, idx: int, url: str) -> Tuple[int, ScrapingResult]:
+        """Process a single URL and return results"""
+        result = ScrapingResult()
+        
+        try:
+            # Add random delay to be respectful
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            
+            # Check website status
+            status = await self.check_website_status(url)
+            result.website_status = status
+            
+            if status == 'Proper':
+                # Extract basic information
+                basic_info = await self.extract_basic_info(url)
+                
+                # Update result with basic info
+                result.instagram_link = basic_info.get('Instagram Link', '')
+                result.facebook_link = basic_info.get('Facebook Link', '')
+                result.twitter_link = basic_info.get('Twitter Link', '')
+                result.pinterest_link = basic_info.get('Pinterest Link', '')
+                result.linkedin_link = basic_info.get('LinkedIn Link', '')
+                result.social_media_presence = basic_info.get('Social Media Presence', 'No')
+                result.emails = basic_info.get('emails', '')
+                result.phone_numbers = basic_info.get('phone_numbers', '')
+                result.street_address = basic_info.get('street_address', '')
+                
+                # Analyze with Selenium for dynamic content
+                selenium_info = await self.analyze_with_selenium(url)
+                result.integrated_videos = selenium_info.get('integrated_videos', 'No')
+                result.integrated_video_urls = selenium_info.get('integrated_video_urls', '')
+                result.d2c_presence = selenium_info.get('d2c_presence', 'No')
+                result.ecommerce_presence = selenium_info.get('ecommerce_presence', 'No')
+            
+        except Exception as e:
+            logger.error(f"Error processing {url}: {e}")
+            
+        return idx, result
+
+async def main():
+    """Main function with improved async processing and checkpointing"""
+    try:
+        # Read input CSV
+        df = pd.read_csv(INPUT_CSV)
+        logger.info(f"Loaded {len(df)} URLs from {INPUT_CSV}")
+        
+        # Initialize checkpoint manager
+        checkpoint_manager = CheckpointManager()
+        processed_urls = checkpoint_manager.get_processed_urls()
+        
+        # Initialize scraper
+        async with WebScraper() as scraper:
+            # Fill missing names
+            for idx, row in df.iterrows():
+                if pd.isna(row.get('Name')) or row.get('Name') == '':
+                    df.at[idx, 'Name'] = scraper.extract_name_from_url(row['Site URL'])
+            
+            # Prepare output columns
+            output_columns = [
+                'Name', 'Site URL', 'Website Status', 'D2C Presence', 'E-Commerce Presence',
+                'Social Media Presence', 'Integrated Videos', 'Integrated Video URLs',
+                'Instagram Link', 'Facebook Link', 'Twitter Link', 'Pinterest Link', 
+                'LinkedIn Link', 'Emails', 'Phone Numbers', 'Street Address'
+            ]
+            
+            for col in output_columns:
+                if col not in df.columns:
+                    df[col] = ''
+            
+            # Load existing results from checkpoint
+            for idx, row in df.iterrows():
+                url = row['Site URL']
+                if url in processed_urls:
+                    saved_result = ScrapingResult(**checkpoint_manager.processed_urls[url]['result'])
+                    df.at[idx, 'Website Status'] = saved_result.website_status
+                    df.at[idx, 'D2C Presence'] = saved_result.d2c_presence
+                    df.at[idx, 'E-Commerce Presence'] = saved_result.ecommerce_presence
+                    df.at[idx, 'Social Media Presence'] = saved_result.social_media_presence
+                    df.at[idx, 'Integrated Videos'] = saved_result.integrated_videos
+                    df.at[idx, 'Integrated Video URLs'] = saved_result.integrated_video_urls
+                    df.at[idx, 'Instagram Link'] = saved_result.instagram_link
+                    df.at[idx, 'Facebook Link'] = saved_result.facebook_link
+                    df.at[idx, 'Twitter Link'] = saved_result.twitter_link
+                    df.at[idx, 'Pinterest Link'] = saved_result.pinterest_link
+                    df.at[idx, 'LinkedIn Link'] = saved_result.linkedin_link
+                    df.at[idx, 'Emails'] = saved_result.emails
+                    df.at[idx, 'Phone Numbers'] = saved_result.phone_numbers
+                    df.at[idx, 'Street Address'] = saved_result.street_address
+            
+            # Process only unprocessed URLs
+            urls_to_process = [(idx, url) for idx, url in enumerate(df['Site URL']) 
+                             if url not in processed_urls]
+            
+            if not urls_to_process:
+                logger.info("All URLs have been processed previously")
+                return df
+            
+            semaphore = asyncio.Semaphore(MAX_WORKERS)
+            
+            async def process_with_checkpoint(idx_url):
+                idx, url = idx_url
+                async with semaphore:
+                    idx, result = await scraper.process_single_url(idx, url)
+                    # Save checkpoint after each URL
+                    checkpoint_manager.save_checkpoint(url, result)
+                    # Save temporary CSV file
+                    df.to_csv(TEMP_OUTPUT_CSV, index=False, quoting=csv.QUOTE_ALL)
+                    return idx, result
+            
+            # Process remaining URLs with progress bar
+            tasks = [process_with_checkpoint(idx_url) for idx_url in urls_to_process]
+            
+            results = []
+            for coro in tqdm(asyncio.as_completed(tasks), 
+                           total=len(tasks), 
+                           desc="Processing URLs"):
+                try:
+                    idx, result = await coro
+                    results.append((idx, result))
+                except Exception as e:
+                    logger.error(f"Error processing URL: {e}")
+                
+            # Update DataFrame with new results
+            for idx, result in results:
+                df.at[idx, 'Website Status'] = result.website_status
+                df.at[idx, 'D2C Presence'] = result.d2c_presence
+                df.at[idx, 'E-Commerce Presence'] = result.ecommerce_presence
+                df.at[idx, 'Social Media Presence'] = result.social_media_presence
+                df.at[idx, 'Integrated Videos'] = result.integrated_videos
+                df.at[idx, 'Integrated Video URLs'] = result.integrated_video_urls
+                df.at[idx, 'Instagram Link'] = result.instagram_link
+                df.at[idx, 'Facebook Link'] = result.facebook_link
+                df.at[idx, 'Twitter Link'] = result.twitter_link
+                df.at[idx, 'Pinterest Link'] = result.pinterest_link
+                df.at[idx, 'LinkedIn Link'] = result.linkedin_link
+                df.at[idx, 'Emails'] = result.emails
+                df.at[idx, 'Phone Numbers'] = result.phone_numbers
+                df.at[idx, 'Street Address'] = result.street_address
+            
+            # Save final results
+            df[output_columns].to_csv(OUTPUT_CSV, index=False, quoting=csv.QUOTE_ALL)
+            
+            # Clean up temporary file
+            if os.path.exists(TEMP_OUTPUT_CSV):
+                os.remove(TEMP_OUTPUT_CSV)
+            
+            logger.info(f"✅ Results saved to {OUTPUT_CSV}")
+            
+            # Print summary
+            proper_sites = len(df[df['Website Status'] == 'Proper'])
+            broken_sites = len(df[df['Website Status'] == 'Broken'])
+            with_social = len(df[df['Social Media Presence'] == 'Yes'])
+            with_videos = len(df[df['Integrated Videos'] == 'Yes'])
+            with_d2c = len(df[df['D2C Presence'] == 'Yes'])
+            with_ecommerce = len(df[df['E-Commerce Presence'] == 'Yes'])
+            
+            print(f"\n📊 Summary:")
+            print(f"Total URLs processed: {len(df)}")
+            print(f"Working websites: {proper_sites}")
+            print(f"Broken websites: {broken_sites}")
+            print(f"Sites with social media: {with_social}")
+            print(f"Sites with videos: {with_videos}")
+            print(f"Sites with D2C features: {with_d2c}")
+            print(f"Sites with e-commerce: {with_ecommerce}")
+            print(f"Street addresses found: {len(df[df['Street Address'] != ''])}")
+            print(f"Total emails found: {df['Emails'].str.split(',').explode().nunique()}")
+            print(f"Total phone numbers found: {df['Phone Numbers'].str.split(',').explode().nunique()}")
+            
+        logger.info("✅ Scraping completed successfully")
+        return df
+            
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
+        raise
+
+if __name__ == '__main__':
+    # Install required packages if not already installed
+    required_packages = ['aiohttp', 'beautifulsoup4', 'pandas', 'selenium', 'webdriver-manager', 'tqdm']
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⚠️  Process interrupted by user")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
