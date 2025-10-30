@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Tuple
 import csv
 
 # Configuration
-INPUT_CSV = 'E:\\nims\\Website Checker\\sites.csv'
+INPUT_CSV = ''
 OUTPUT_CSV = 'output.csv'
 MAX_WORKERS = 15  # Increased for better performance
 SELENIUM_POOL_SIZE = 5  # Number of Selenium instances to keep in pool
@@ -734,4 +734,5 @@ if __name__ == '__main__':
         print("\n⚠️  Process interrupted by user")
     except Exception as e:
         print(f"❌ Error: {e}")
+
         logger.error(f"Fatal error: {e}", exc_info=True)
